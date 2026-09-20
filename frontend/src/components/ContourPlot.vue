@@ -9,6 +9,14 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
 import { useOptimizationStore } from '../store/optimization'
+import {
+  computeViewRanges,
+  createProjector,
+  colorCss,
+  drawPath2D,
+  drawMarkers2D,
+  markerPlacements,
+} from '../lib/viewScale'
 const store = useOptimizationStore()
 const cvs = ref<HTMLCanvasElement>()
 
@@ -22,16 +30,9 @@ function draw() {
   const path = store.result?.path || []
   if (path.length === 0) return
 
-  // Find ranges
-  const xs = path.map(p => p.x), ys = path.map(p => p.y)
-  const xMin = Math.min(...xs), xMax = Math.max(...xs)
-  const yMin = Math.min(...ys), yMax = Math.max(...ys)
-  const padX = (xMax - xMin) * 0.2 || 1
-  const padY = (yMax - yMin) * 0.2 || 1
-  const rx = xMin - padX, ry = yMin - padY, rw = xMax - xMin + 2 * padX, rh = yMax - yMin + 2 * padY
-
-  const tx = (v: number) => ((v - rx) / rw) * W
-  const ty = (v: number) => H - ((v - ry) / rh) * H
+  // 共用范围 + 投影（与 3D 画面同一份换算）
+  const ranges = computeViewRanges(path)!
+  const proj = createProjector(ranges, W, H)
 
   // Draw contour-like grid
   ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1
@@ -41,42 +42,22 @@ function draw() {
   }
 
   // Draw heatmap-style fill based on z values
-  const zs = path.map(p => p.z); const zMin = Math.min(...zs), zMax = Math.max(...zs)
-  const zr = zMax - zMin || 1
   for (const pt of path) {
-    const t = (pt.z - zMin) / zr
-    const px = tx(pt.x), py = ty(pt.y)
+    const { px, py } = proj.to2D(pt)
     // blend: red (high) → blue (low)
-    const r = Math.round(255 * t), b = Math.round(255 * (1 - t)), g = Math.round(128 * (1 - Math.abs(t - 0.5) * 2))
-    ctx.fillStyle = `rgba(${r},${g},${b},0.3)`
+    ctx.fillStyle = colorCss(proj.tz(pt.z), 0.3)
     ctx.beginPath(); ctx.arc(px, py, 2.5, 0, Math.PI * 2); ctx.fill()
   }
 
   // Draw path line
   const animPath = store.currentPath()
-  if (animPath.length > 1) {
-    ctx.strokeStyle = 'rgba(0, 255, 200, 0.8)'; ctx.lineWidth = 2
-    ctx.beginPath()
-    ctx.moveTo(tx(animPath[0].x), ty(animPath[0].y))
-    for (let i = 1; i < animPath.length; i++) ctx.lineTo(tx(animPath[i].x), ty(animPath[i].y))
-    ctx.stroke()
-  }
+  drawPath2D(ctx, animPath, proj)
 
-  // Start point
-  ctx.fillStyle = '#4fc3f7'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2
-  ctx.beginPath(); ctx.arc(tx(path[0].x), ty(path[0].y), 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
-
-  // Current point
-  const cur = animPath[animPath.length - 1]
-  ctx.fillStyle = '#66bb6a'
-  ctx.beginPath(); ctx.arc(tx(cur.x), ty(cur.y), 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
-
-  // Final point
-  const last = path[path.length - 1]
-  ctx.fillStyle = '#ef5350'
-  ctx.beginPath(); ctx.arc(tx(last.x), ty(last.y), 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+  // Start / current / final markers
+  drawMarkers2D(ctx, markerPlacements(path, animPath), proj)
 
   // Labels
+  const cur = animPath[animPath.length - 1]
   ctx.fillStyle = '#aaa'; ctx.font = '11px system-ui'
   ctx.fillText(`x: ${cur.x.toFixed(3)}`, 10, 20)
   ctx.fillText(`y: ${cur.y.toFixed(3)}`, 10, 36)
