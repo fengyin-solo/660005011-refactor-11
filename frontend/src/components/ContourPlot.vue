@@ -7,10 +7,25 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { useOptimizationStore } from '../store/optimization'
+import {
+  createOptimizationView, animatedPoints, markerPoints, project2D,
+  zColorCss, MARKER_STYLES, MARKER_STROKE_2D, PATH_LINE,
+  type MarkerRole,
+} from '../utils/visualization'
+
 const store = useOptimizationStore()
 const cvs = ref<HTMLCanvasElement>()
+
+// 视图模型只在结果变化时重算，动画/拖动进度时复用归一化坐标
+const view = computed(() => createOptimizationView(store.result?.path ?? []))
+
+function drawMarker(ctx: CanvasRenderingContext2D, x: number, y: number, role: MarkerRole) {
+  const style = MARKER_STYLES[role]
+  ctx.fillStyle = style.color
+  ctx.beginPath(); ctx.arc(x, y, style.radius2D, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+}
 
 function draw() {
   const c = cvs.value!; const ctx = c.getContext('2d')!; const W = c.width, H = c.height
@@ -19,19 +34,8 @@ function draw() {
   // Fill background
   ctx.fillStyle = '#0a1929'; ctx.fillRect(0, 0, W, H)
 
-  const path = store.result?.path || []
-  if (path.length === 0) return
-
-  // Find ranges
-  const xs = path.map(p => p.x), ys = path.map(p => p.y)
-  const xMin = Math.min(...xs), xMax = Math.max(...xs)
-  const yMin = Math.min(...ys), yMax = Math.max(...ys)
-  const padX = (xMax - xMin) * 0.2 || 1
-  const padY = (yMax - yMin) * 0.2 || 1
-  const rx = xMin - padX, ry = yMin - padY, rw = xMax - xMin + 2 * padX, rh = yMax - yMin + 2 * padY
-
-  const tx = (v: number) => ((v - rx) / rw) * W
-  const ty = (v: number) => H - ((v - ry) / rh) * H
+  const v = view.value
+  if (!v) return
 
   // Draw contour-like grid
   ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1
@@ -40,43 +44,31 @@ function draw() {
     const y = i / 10 * H; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke()
   }
 
-  // Draw heatmap-style fill based on z values
-  const zs = path.map(p => p.z); const zMin = Math.min(...zs), zMax = Math.max(...zs)
-  const zr = zMax - zMin || 1
-  for (const pt of path) {
-    const t = (pt.z - zMin) / zr
-    const px = tx(pt.x), py = ty(pt.y)
-    // blend: red (high) → blue (low)
-    const r = Math.round(255 * t), b = Math.round(255 * (1 - t)), g = Math.round(128 * (1 - Math.abs(t - 0.5) * 2))
-    ctx.fillStyle = `rgba(${r},${g},${b},0.3)`
+  // Draw heatmap-style fill based on z values（与 3D 同一套颜色映射）
+  for (const pt of v.points) {
+    const [px, py] = project2D(pt, W, H)
+    ctx.fillStyle = zColorCss(pt.t, 0.3)
     ctx.beginPath(); ctx.arc(px, py, 2.5, 0, Math.PI * 2); ctx.fill()
   }
 
   // Draw path line
-  const animPath = store.currentPath()
-  if (animPath.length > 1) {
-    ctx.strokeStyle = 'rgba(0, 255, 200, 0.8)'; ctx.lineWidth = 2
+  const animPts = animatedPoints(v, store.animationStep)
+  if (animPts.length > 1) {
+    ctx.strokeStyle = PATH_LINE.css2D; ctx.lineWidth = PATH_LINE.width2D
     ctx.beginPath()
-    ctx.moveTo(tx(animPath[0].x), ty(animPath[0].y))
-    for (let i = 1; i < animPath.length; i++) ctx.lineTo(tx(animPath[i].x), ty(animPath[i].y))
+    ctx.moveTo(...project2D(animPts[0], W, H))
+    for (let i = 1; i < animPts.length; i++) ctx.lineTo(...project2D(animPts[i], W, H))
     ctx.stroke()
   }
 
-  // Start point
-  ctx.fillStyle = '#4fc3f7'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2
-  ctx.beginPath(); ctx.arc(tx(path[0].x), ty(path[0].y), 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
-
-  // Current point
-  const cur = animPath[animPath.length - 1]
-  ctx.fillStyle = '#66bb6a'
-  ctx.beginPath(); ctx.arc(tx(cur.x), ty(cur.y), 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
-
-  // Final point
-  const last = path[path.length - 1]
-  ctx.fillStyle = '#ef5350'
-  ctx.beginPath(); ctx.arc(tx(last.x), ty(last.y), 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+  // Start / current / end markers（与 3D 同一套取点与样式）
+  ctx.strokeStyle = MARKER_STROKE_2D; ctx.lineWidth = 2
+  for (const { role, point } of markerPoints(v, store.animationStep)) {
+    drawMarker(ctx, ...project2D(point, W, H), role)
+  }
 
   // Labels
+  const cur = animPts[animPts.length - 1].raw
   ctx.fillStyle = '#aaa'; ctx.font = '11px system-ui'
   ctx.fillText(`x: ${cur.x.toFixed(3)}`, 10, 20)
   ctx.fillText(`y: ${cur.y.toFixed(3)}`, 10, 36)
@@ -84,7 +76,7 @@ function draw() {
 }
 
 onMounted(draw)
-watch(() => [store.result, store.animationStep], draw, { deep: true })
+watch([view, () => store.animationStep], draw)
 </script>
 
 <style scoped>

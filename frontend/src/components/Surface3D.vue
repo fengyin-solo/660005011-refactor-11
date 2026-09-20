@@ -6,15 +6,26 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { useOptimizationStore } from '../store/optimization'
+import {
+  createOptimizationView, animatedPoints, markerPoints, project3D,
+  zColorRGB01, MARKER_STYLES, PATH_LINE,
+  type MarkerRole, type ViewPoint,
+} from '../utils/visualization'
 
 const store = useOptimizationStore()
 const container = ref<HTMLDivElement>()
 let scene: THREE.Scene, camera: THREE.PerspectiveCamera, renderer: THREE.WebGLRenderer, controls: OrbitControls, animId: number
-let surfaceGroup = new THREE.Group(), pathGroup = new THREE.Group()
+// 静态组：曲面散点，仅在结果变化时重建
+const staticGroup = new THREE.Group()
+// 动态组：路径折线 + 位置标记，随动画步更新
+const dynamicGroup = new THREE.Group()
+
+// 与 2D 共用同一份视图模型（同一套范围换算与颜色映射）
+const view = computed(() => createOptimizationView(store.result?.path ?? []))
 
 function initScene() {
   const c = container.value!; scene = new THREE.Scene(); scene.background = new THREE.Color(0x111827)
@@ -25,58 +36,78 @@ function initScene() {
   scene.add(new THREE.AmbientLight(0x404060, 1.5))
   const dl = new THREE.DirectionalLight(0xffffff, 1); dl.position.set(3, 4, 3); scene.add(dl)
   const dl2 = new THREE.DirectionalLight(0x6688cc, 0.4); dl2.position.set(-3, -2, -2); scene.add(dl2)
-  scene.add(surfaceGroup); scene.add(pathGroup)
+  scene.add(staticGroup); scene.add(dynamicGroup)
 }
-function buildSurface() {
-  surfaceGroup.clear(); pathGroup.clear()
-  const path = store.result?.path || []; if (!path.length) return
-  const xs = path.map(p => p.x), ys = path.map(p => p.y), zs = path.map(p => p.z)
-  const xMin = Math.min(...xs), xMax = Math.max(...xs), yMin = Math.min(...ys), yMax = Math.max(...ys)
-  const zMin = Math.min(...zs), zMax = Math.max(...zs)
-  const px = xMax - xMin || 1, py = yMax - yMin || 1, pz = zMax - zMin || 1
-  const scale = 3
-  const map = (x: number, y: number) => ((x - xMin) / px - 0.5) * scale
-  const mapy = (y: number) => ((y - yMin) / py - 0.5) * scale
-  const mapz = (z: number) => ((z - zMin) / pz) * 2
+
+function disposeGroup(g: THREE.Group) {
+  g.traverse((obj) => {
+    if (obj instanceof THREE.Points || obj instanceof THREE.Line || obj instanceof THREE.Mesh) {
+      obj.geometry.dispose()
+      const materials = Array.isArray(obj.material) ? obj.material : [obj.material]
+      materials.forEach(m => m.dispose())
+    }
+  })
+  g.clear()
+}
+
+function addMarker(point: ViewPoint, role: MarkerRole) {
+  const style = MARKER_STYLES[role]
+  const s = new THREE.Mesh(
+    new THREE.SphereGeometry(style.radius3D, 16, 16),
+    new THREE.MeshPhongMaterial({ color: style.color, emissive: style.color, emissiveIntensity: 0.5 })
+  )
+  s.position.set(...project3D(point))
+  dynamicGroup.add(s)
+}
+
+// 结果变化时重建静态内容（曲面散点）
+function buildStatic() {
+  disposeGroup(staticGroup)
+  const v = view.value; if (!v) return
 
   // Surface points as scattered dots
-  const geom = new THREE.BufferGeometry()
   const positions: number[] = [], colors: number[] = []
-  for (const pt of path) {
-    positions.push(map(pt.x, pt.y), mapz(pt.z), mapy(pt.y))
-    const t = (pt.z - zMin) / pz
-    colors.push(t, 0.3 * (1 - t), 1 - t)
+  for (const pt of v.points) {
+    positions.push(...project3D(pt))
+    colors.push(...zColorRGB01(pt.t))
   }
+  const geom = new THREE.BufferGeometry()
   geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
   geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3))
   const mat = new THREE.PointsMaterial({ size: 0.05, vertexColors: true, blending: THREE.AdditiveBlending, depthWrite: false })
-  surfaceGroup.add(new THREE.Points(geom, mat))
+  staticGroup.add(new THREE.Points(geom, mat))
+}
+
+// 动画步变化时只更新动态内容（路径折线 + 起点/当前步/终点标记）
+function updateDynamic() {
+  disposeGroup(dynamicGroup)
+  const v = view.value; if (!v) return
 
   // Path line
-  const animPath = store.currentPath()
-  if (animPath.length > 1) {
+  const animPts = animatedPoints(v, store.animationStep)
+  if (animPts.length > 1) {
     const lineGeom = new THREE.BufferGeometry()
     const pts: number[] = []
-    for (const pt of animPath) pts.push(map(pt.x, pt.y), mapz(pt.z), mapy(pt.y))
+    for (const pt of animPts) pts.push(...project3D(pt))
     lineGeom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3))
-    pathGroup.add(new THREE.Line(lineGeom, new THREE.LineBasicMaterial({ color: 0x00ffcc, linewidth: 1 })))
+    dynamicGroup.add(new THREE.Line(lineGeom, new THREE.LineBasicMaterial({ color: PATH_LINE.color })))
   }
 
   // Start/current/end markers
-  const marker = (x: number, y: number, z: number, color: number, size = 0.12) => {
-    const s = new THREE.Mesh(new THREE.SphereGeometry(size, 16, 16), new THREE.MeshPhongMaterial({ color, emissive: color, emissiveIntensity: 0.5 }))
-    s.position.set(x, z, y); pathGroup.add(s)
-  }
-  if (path.length) {
-    const first = path[0]; marker(map(first.x, first.y), mapy(first.y), mapz(first.z), 0x4fc3f7, 0.14)
-    const cur = animPath[animPath.length - 1]; marker(map(cur.x, cur.y), mapy(cur.y), mapz(cur.z), 0x66bb6a, 0.12)
-    const last = path[path.length - 1]; marker(map(last.x, last.y), mapy(last.y), mapz(last.z), 0xef5350, 0.14)
-  }
+  for (const { role, point } of markerPoints(v, store.animationStep)) addMarker(point, role)
 }
+
+function rebuildAll() { buildStatic(); updateDynamic() }
+
 function animate() { animId = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera) }
-onMounted(() => { initScene(); buildSurface(); animate() })
-watch(() => [store.result, store.animationStep], buildSurface, { deep: true })
-onUnmounted(() => { cancelAnimationFrame(animId); renderer?.dispose() })
+onMounted(() => { initScene(); rebuildAll(); animate() })
+watch(view, rebuildAll)
+watch(() => store.animationStep, updateDynamic)
+onUnmounted(() => {
+  cancelAnimationFrame(animId)
+  disposeGroup(staticGroup); disposeGroup(dynamicGroup)
+  renderer?.dispose()
+})
 </script>
 
 <style scoped>
